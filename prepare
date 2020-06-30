@@ -1,0 +1,213 @@
+#!/bin/bash
+set -euo pipefail
+shopt -s nullglob
+
+
+# source command line arguments
+while [ ! -z "${1+x}" ]; do
+	# shellcheck source=/dev/null
+	. "$1"
+	shift
+done
+
+
+# variables that are commonly customized (default values are only used if unset)
+
+# input and output directory
+: "${inputDir:=input}"
+: "${outputDir:=output}"
+
+# the types for the default image ("$inputDir/default.TYPE") are tried in this order
+[ -z "${defaultImageSearchTypes+x}" ] && defaultImageSearchTypes=(svg png jpg jpeg gif)
+# : "${defaultImageSearchTypes:=(svg png jpg jpeg gif)}"
+
+
+# the image sizes that should be created as an array of FROM-TO:STEP  (FROM/TO inclusive)
+[ -z "${resizeRanges+x}" ] && resizeRanges=(8-16:1 16-64:2 64-128:8 128-512:16)
+# image types (png is default and should always be specified)
+[ -z "${outputTypes+x}" ] && outputTypes=(png jpg)
+
+# provide additional output if set to 1
+: "${verbose:=0}"
+
+# docker image used if docker is available but ImageMagick is not found
+: "${dockerImage:=isotes/static-gravatar-server-prepare}"
+
+
+
+# For the conversion, the implementation uses 3 functions
+# - imgConvert INPUT OUTPUT [SIZE]
+# - imgConvertPrepare INPUT-DIRECTORY OUTPUT-DIRECTORY
+# - imgConvertFinally
+# Only 'imgConvert' is required and the 2 other functions are only called if they exist. 'imgConvertPrepare' is called before the first 'imgConvert' is executed and 'imgConvertFinally' after the last 'imgConvert'.
+# 'imgConvert' is used to perform the conversion and optional rescaling to SIZExSIZE.
+# If 'imgConvert' is not manually specified, the code below detects the ImageMagick commands 'convert' and 'magick' and uses a Docker image with ImageMagick if a 'docker' command is executable.
+
+
+# For generating missing images, the implementation calls
+#   imgGenerate USER EMAIL OUTPUT-FILE
+# with OUTPUT-FILE having the extension $generatedType as set below (only change if a custom imgGenerate function is provided)
+: "${generatedType:=svg}"
+
+# The default implementation creates a circle containing the 2-character 'initials' or beginning of the email address (alfred.friend@... -> AF, user@... -> US) as an SVG image. The color of the circle is used from the following array (the text is always a very bright grey).
+[ -z "${generatedColors+x}" ] && generatedColors=(purple blueviolet blue darkcyan darkblue darkred forestgreen saddlebrown maroon darkslategray)
+
+
+# end of settings meant for overriding
+
+
+# utility function to check if the argument can be run (i.e., is a shell function, command line program in PATH, etc.)
+function canRun {
+	type "$1" &> /dev/null
+}
+
+function info {
+	[ "$verbose" = "1" ] && echo "$@"
+	true
+}
+
+if canRun imgConvert; then
+	: # custom function exists, do nothing
+elif canRun convert; then
+	function imgConvert {
+		imArgs "$@" && convert "${imArgsResult[@]}"
+	}
+elif canRun magick; then
+	function imgConvert {
+		imArgs "$@" && magick "${imArgsResult[@]}"
+	}
+elif canRun docker; then
+	info 'ImageMagick not found but detected docker'
+	# with docker, we start the container once and use exec instead of running the container for each convert command, which saves us around 80% of time
+	convContainer="gravatar-prepare-$$"
+	function imgConvert {
+		# adapt paths of the input and output file
+		local s="/images/${1#$outputDir/}"
+		local d="/images/${2#$outputDir/}"
+		shift 2
+		imArgs "$s" "$d" "$@"
+		docker exec -w /images -u $UID:${GROUPS[0]} $convContainer convert "${imArgsResult[@]}"
+	}
+	function imgConvertPrepare {
+		local outd
+		outd="$(cd "$2"; pwd)"
+		docker run -v "$outd:/images" --rm -d --name $convContainer --entrypoint=/usr/bin/sleep "$dockerImage" 3600
+	}
+	function imgConvertFinally {
+		docker rm -f $convContainer
+	}
+else
+	echo "Fatal: Neither ImageMagick nor docker have been detected and a custom 'imgConvert' command has not been specified. Install ImageMagick or docker or see comments in '$0' on how to specify a custom function."
+	exit 1
+fi
+
+canRun imgGenerate || function imgGenerate {
+	local initials="${1:0:2}"
+	[[ $1 =~ ([[:alnum:]]).*\.([[:alnum:]]) ]] && initials="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
+	initials="$(echo "$initials" | tr '[:lower:]' '[:upper:]')"
+	# use the first 4 hex-digits of the md5sum to select the color
+	local hash
+	hash="$(printf "%s" "$2" | md5sum | cut -c 1-4)"
+	hash=$((16#$hash))
+	hash=$((hash % ${#generatedColors[@]}))
+	local color="${generatedColors[$hash]}"
+	# "y='50%' dominant-baseline='central'"" works in Chrome but not (to various degrees) with ImageMagick, rsvg, or Inkscape
+	echo "<svg version='1.1' baseProfile='full' width='400' height='400' xmlns='http://www.w3.org/2000/svg'> <circle cx='50%' cy='50%' r='50%' fill='$color' /> <text x='50%' y='275' text-anchor='middle' font-size='200px' font-weight='bold' font-family=\"'DejaVu Sans'\" fill='#eee'>$initials</text> </svg>" > "$3"
+}
+
+
+
+# convert FROM-TO:SEQ to FROM SEQ TO+1
+function seqArgs {
+	[[ $range =~ ([[:digit:]]+)+-([[:digit:]]+)+:([[:digit:]]+) ]] || { echo "Error for range '$range': range must be in the format FROM-TO,STEP"; exit 1; }
+	echo "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[2]}"
+}
+
+# convert INPUT OUTPUT [SIZE] to INPUT [-resize SIZExSIZE] OUTPUT
+function imArgs {
+	[ -z "${3+x}" ] && imArgsResult=(-background none "$1" "$2") || imArgsResult=(-background none "$1" -resize "$3x$3" "$2")
+}
+
+# SRC-IMAGE EMAIL|LITERAL
+function createVariants {
+	local srcimg="$1"
+	local hash="$2"
+	# if string includes '@', assume email and calculate hash
+	[[ $hash != *@* ]] || hash="$(printf "%s" "$hash" | md5sum | cut -f 1 -d ' ')"
+	local skipExisting=false
+	local dest="$outputDir/$hash/original.${srcimg##*.}"
+	mkdir -p "$outputDir/$hash"
+	echo " to $hash"
+	diff -q "$srcimg" "$dest" &>/dev/null && skipExisting=true
+	[[ -f $dest && $skipExisting = true ]] || cp "$srcimg" "$dest"
+	srcimg="$dest" # only use the copy from here on
+	for type in "${outputTypes[@]}"; do
+		for range in "${resizeRanges[@]}"; do
+			for s in $(seq $(seqArgs "$range")); do
+				local dest="$outputDir/$hash/$s.$type"
+				[[ -f $dest && $skipExisting = true ]] ||imgConvert "$srcimg" "$dest" "${s}"
+			done
+		done
+		# to be used if requested size is not present
+		local dest="$outputDir/$hash/org.$type"
+		[[ -f $dest && $skipExisting = true ]] || imgConvert  "$srcimg" "$dest"
+	done
+}
+
+# SRC-IMAGE EMAIL
+function createVariantsForEmail {
+	local hash
+	hash="$(printf "%s" "$2" | md5sum | cut -f 1 -d ' ')"
+	createVariants "$srcimg" "$hash"
+}
+
+for v in inputDir outputDir defaultImageSearchTypes resizeRanges outputTypes generatedType generatedColors; do
+	info "$v: $(eval echo "\${${v}[@]}")"
+done
+
+# check range args
+for range in "${resizeRanges[@]}"; do
+	: "$(seqArgs "$range")"
+done
+
+
+
+mkdir -p "$outputDir"
+
+canRun imgConvertPrepare && imgConvertPrepare "$inputDir" "$outputDir"
+canRun imgConvertFinally && trap imgConvertFinally EXIT
+
+for type in "${defaultImageSearchTypes[@]}" /; do
+	[ "$type" = "/" ] && { echo "Default image not found"; exit 1; }
+	srcimg="$inputDir/default.$type"
+	info "Trying default image $srcimg"
+	if [ -r "$srcimg" ]; then
+		printf " - Convert  %-25s" "$srcimg"
+		createVariants "$srcimg" default
+		break
+	fi
+done
+
+# create images for users
+for domainDir in "$inputDir"/*; do
+	emails=" "
+	for srcimg in "$domainDir"/*; do
+		[[ $srcimg = *.txt ]] && continue
+		filename="${srcimg##*/}"
+		email="$(echo "${filename%.*}@${domainDir##*/}" | tr '[:upper:]' '[:lower:]')"
+		printf " - Convert  %-25s" "$email"
+		createVariants "$srcimg" "$email"
+		emails="$emails$email "
+	done
+	[ -r "$domainDir/users.txt" ] && while read -r user; do
+		[[ $user =~ [[:space:]]*\# ]] && continue # ignore comment lines
+		email="$(echo "${user}@${domainDir##*/}" | tr '[:upper:]' '[:lower:]')"
+		[[ $emails == *"$email"* ]] && continue # and ones that have a file
+		printf " - Generate %-25s" "$email"
+		srcimg="$outputDir/tmp.$generatedType"
+		imgGenerate "$user" "$email" "$srcimg"
+		createVariants "$srcimg" "$email"
+		rm "$srcimg"
+	done < "$domainDir/users.txt"
+done
+
